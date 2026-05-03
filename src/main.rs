@@ -1,26 +1,21 @@
-use regex::Regex;
+mod hooks;
+mod twig;
+
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use walkdir::WalkDir;
 
-#[derive(Debug, Clone)]
-struct Hook {
-    name: String,
-    params: String,
-    description: String,
-}
+use crate::hooks::Hook;
 
 #[derive(Debug)]
 struct Backend {
     client: Client,
     workspace_roots: RwLock<Vec<PathBuf>>,
     hooks: RwLock<HashMap<String, Hook>>,
+    documents: RwLock<HashMap<Url, String>>,
 }
 
 impl Backend {
@@ -29,44 +24,13 @@ impl Backend {
             client,
             workspace_roots: RwLock::new(Vec::new()),
             hooks: RwLock::new(HashMap::new()),
+            documents: RwLock::new(HashMap::new()),
         }
     }
 
-    async fn scan_workspace(&self) {
+    async fn rescan(&self) {
         let roots = self.workspace_roots.read().await.clone();
-        let mut all_hooks: HashMap<String, Hook> = HashMap::new();
-        let mut files_scanned = 0usize;
-
-        for root in &roots {
-            for entry in WalkDir::new(root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|e| {
-                    let name = e.file_name().to_string_lossy();
-                    !matches!(name.as_ref(), ".git" | "node_modules")
-                })
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if !name.ends_with(".api.php") {
-                    continue;
-                }
-                let Ok(content) = fs::read_to_string(path) else {
-                    continue;
-                };
-                files_scanned += 1;
-                for hook in extract_hooks(&content) {
-                    all_hooks.entry(hook.name.clone()).or_insert(hook);
-                }
-            }
-        }
-
+        let (all_hooks, files_scanned) = hooks::scan_workspace(&roots);
         let count = all_hooks.len();
         *self.hooks.write().await = all_hooks;
         self.client
@@ -76,35 +40,53 @@ impl Backend {
             )
             .await;
     }
+
+    async fn hook_completions(&self) -> Vec<CompletionItem> {
+        let hooks = self.hooks.read().await;
+        if hooks.is_empty() {
+            return vec![CompletionItem {
+                label: "hook_help".into(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("No *.api.php files indexed in workspace".into()),
+                insert_text: Some("hook_help".into()),
+                ..Default::default()
+            }];
+        }
+        hooks
+            .values()
+            .map(|h| {
+                let suffix = h.name.strip_prefix("hook_").unwrap_or(&h.name);
+                let snippet = format!(
+                    "function ${{1:my_module}}_{}({}) {{\n  $0\n}}",
+                    suffix, h.params
+                );
+                CompletionItem {
+                    label: h.name.clone(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: if h.description.is_empty() {
+                        Some("Drupal hook".into())
+                    } else {
+                        Some(h.description.clone())
+                    },
+                    insert_text: Some(snippet),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    async fn line_before_cursor(&self, uri: &Url, position: Position) -> Option<String> {
+        let docs = self.documents.read().await;
+        let text = docs.get(uri)?;
+        let line = text.lines().nth(position.line as usize)?;
+        let end = (position.character as usize).min(line.len());
+        Some(line[..end].to_string())
+    }
 }
 
-fn hook_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?ms)(?:/\*\*(.*?)\*/\s*)?function\s+(hook_\w+)\s*\(([^)]*)\)").unwrap()
-    })
-}
-
-fn extract_hooks(content: &str) -> Vec<Hook> {
-    hook_regex()
-        .captures_iter(content)
-        .map(|cap| {
-            let phpdoc = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let name = cap[2].to_string();
-            let params = cap[3].split_whitespace().collect::<Vec<_>>().join(" ");
-            let description = extract_phpdoc_summary(phpdoc);
-            Hook { name, params, description }
-        })
-        .collect()
-}
-
-fn extract_phpdoc_summary(phpdoc: &str) -> String {
-    phpdoc
-        .lines()
-        .map(|l| l.trim().trim_start_matches('*').trim())
-        .find(|l| !l.is_empty() && !l.starts_with('@'))
-        .unwrap_or("")
-        .to_string()
+fn is_twig_uri(uri: &Url) -> bool {
+    uri.path().ends_with(".twig")
 }
 
 #[tower_lsp::async_trait]
@@ -138,7 +120,12 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["_".into()]),
+                    trigger_characters: Some(vec![
+                        "_".into(),
+                        "|".into(),
+                        "{".into(),
+                        "%".into(),
+                    ]),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -150,52 +137,50 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "drupal-lsp ready, scanning workspace")
             .await;
-        self.scan_workspace().await;
+        self.rescan().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
     }
 
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.documents
+            .write()
+            .await
+            .insert(params.text_document.uri, params.text_document.text);
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        if let Some(change) = params.content_changes.into_iter().next_back() {
+            self.documents
+                .write()
+                .await
+                .insert(params.text_document.uri, change.text);
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.documents.write().await.remove(&params.text_document.uri);
+    }
+
     async fn completion(
         &self,
-        _params: CompletionParams,
+        params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
-        let hooks = self.hooks.read().await;
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
 
-        if hooks.is_empty() {
-            return Ok(Some(CompletionResponse::Array(vec![CompletionItem {
-                label: "hook_help".into(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some("No *.api.php files indexed in workspace".into()),
-                insert_text: Some("hook_help".into()),
-                ..Default::default()
-            }])));
+        if is_twig_uri(&uri) {
+            let line = self
+                .line_before_cursor(&uri, position)
+                .await
+                .unwrap_or_default();
+            let items = twig::completions(&line);
+            return Ok(Some(CompletionResponse::Array(items)));
         }
 
-        let items: Vec<CompletionItem> = hooks
-            .values()
-            .map(|h| {
-                let suffix = h.name.strip_prefix("hook_").unwrap_or(&h.name);
-                let snippet = format!(
-                    "function ${{1:my_module}}_{}({}) {{\n  $0\n}}",
-                    suffix, h.params
-                );
-                CompletionItem {
-                    label: h.name.clone(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    detail: if h.description.is_empty() {
-                        Some("Drupal hook".into())
-                    } else {
-                        Some(h.description.clone())
-                    },
-                    insert_text: Some(snippet),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                }
-            })
-            .collect();
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(Some(CompletionResponse::Array(self.hook_completions().await)))
     }
 }
 
@@ -205,44 +190,4 @@ async fn main() {
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_hook_with_phpdoc() {
-        let src = r#"
-/**
- * Provide help text.
- *
- * @param string $route_name
- * @return string
- */
-function hook_help($route_name, RouteMatchInterface $route_match) {
-}
-"#;
-        let hooks = extract_hooks(src);
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].name, "hook_help");
-        assert_eq!(hooks[0].description, "Provide help text.");
-        assert!(hooks[0].params.contains("$route_name"));
-    }
-
-    #[test]
-    fn extracts_hook_without_phpdoc() {
-        let src = "function hook_form_alter(&$form, $form_state, $form_id) {}";
-        let hooks = extract_hooks(src);
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].name, "hook_form_alter");
-    }
-
-    #[test]
-    fn skips_non_hook_functions() {
-        let src = "function some_helper() {} function hook_x() {}";
-        let hooks = extract_hooks(src);
-        assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0].name, "hook_x");
-    }
 }
